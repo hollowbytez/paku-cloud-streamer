@@ -291,17 +291,7 @@ def _local_props() -> dict:
 
 
 def build_super_props(launch_signature: str, heartbeat_session: str) -> tuple[str, dict]:
-    try:
-        req = urllib.request.Request(
-            PROPERTIES_URL,
-            method="POST",
-            data=b"{}",
-            headers={"content-type": "application/json", "user-agent": USER_AGENT},
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            props = json.loads(resp.read().decode("utf-8"))["properties"]
-    except Exception:
-        props = _local_props()
+    props = _local_props()
     props["client_launch_id"] = str(uuid.uuid4())
     props["launch_signature"] = launch_signature
     props["client_heartbeat_session_id"] = heartbeat_session
@@ -309,32 +299,8 @@ def build_super_props(launch_signature: str, heartbeat_session: str) -> tuple[st
     return base64.b64encode(raw).decode("ascii"), props
 
 
-def _read_analytics_token(auth_token: str, super_props: str) -> str:
-    req = urllib.request.Request(
-        ME_URL,
-        headers={
-            "authorization": auth_token,
-            "user-agent": USER_AGENT,
-            "x-super-properties": super_props,
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"token rejected (HTTP {exc.code})") from exc
-    token = data.get("analytics_token")
-    if not token:
-        raise RuntimeError("no analytics_token returned by discord")
-    return token
-
-
 def ensure_token(state: State, super_props: str) -> None:
-    if not state.is_stale:
-        return
-    state.analytics_token = _read_analytics_token(state.token, super_props)
-    state.fetched_at = int(time.time())
-    state.save()
+    return
 
 
 @dataclass(frozen=True)

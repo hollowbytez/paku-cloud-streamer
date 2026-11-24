@@ -94,10 +94,6 @@ class PakuCloudBridgeDaemon:
             last_channel_id=channel_id,
         )
         session = Session.new()
-        try:
-            ensure_token(state, session.super_props)
-        except Exception as exc:
-            self.console.warn("token", f"ensure_token notice: {exc}")
 
         engine = HeadlessGatewayStreamEngine(state, session, self.console)
         with self._lock:

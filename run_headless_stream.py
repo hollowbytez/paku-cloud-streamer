@@ -86,10 +86,6 @@ def main():
         last_channel_id=CHANNEL_ID,
     )
     session = Session.new()
-    try:
-        ensure_token(state, session.super_props)
-    except Exception as exc:
-        console.warn("token", f"ensure_token notice: {exc}")
 
     engine = HeadlessGatewayStreamEngine(state, session, console)
     engine.start_stream_headless(GUILD_ID, CHANNEL_ID, CHANNEL_NAME)
