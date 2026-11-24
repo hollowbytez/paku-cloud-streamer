@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: paku-cloud-streamer
+    runtime: docker
+    plan: free
+    region: oregon
+    branch: main
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: AUTO_STREAM
+        value: "false"
+      - key: BRIDGE_HOST
+        value: paku-prime-cloudflare.pagalonetap7770.workers.dev
+      - key: ACCOUNT_ID
+        value: "811953657170886766"
+      - key: GUILD_ID
+        value: "1532381427906380021"
+      - key: CHANNEL_ID
+        value: "1574696579963559996"
+      - key: CHANNEL_NAME
+        value: "Farm V1"
