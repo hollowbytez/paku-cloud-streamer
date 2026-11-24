@@ -84,14 +84,13 @@ SCIENCE_URL = "https://discord.com/api/v9/science"
 PROPERTIES_URL = "https://cordapi.dolfi.es/api/v2/properties/windows"
 GATEWAY_URL = "gateway.discord.gg"
 
-CLIENT_VERSION = "1.0.9253"
-CLIENT_BUILD_NUMBER = 594031
-NATIVE_BUILD_NUMBER = 88414
-OS_VERSION = "10.0.26200"
+CLIENT_VERSION = "1.0.9180"
+CLIENT_BUILD_NUMBER = 376281
+NATIVE_BUILD_NUMBER = 68412
+OS_VERSION = "10.0.22631"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) discord/1.0.9253 Chrome/148.0.7778.280 "
-    "Electron/42.7.1 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 )
 
 AUTH_MAX_AGE = 12 * 3600
@@ -272,21 +271,19 @@ class State:
 def _local_props() -> dict:
     return {
         "os": "Windows",
-        "browser": "Discord Client",
-        "release_channel": "stable",
-        "client_version": CLIENT_VERSION,
-        "os_version": OS_VERSION,
-        "os_arch": "x64",
-        "app_arch": "x64",
+        "browser": "Chrome",
+        "device": "",
         "system_locale": "en-US",
-        "has_client_mods": False,
         "browser_user_agent": USER_AGENT,
-        "browser_version": "42.7.1",
-        "os_sdk_version": "26200",
+        "browser_version": "133.0.0.0",
+        "os_version": "10",
+        "referrer": "",
+        "referring_domain": "",
+        "referrer_current": "",
+        "referring_domain_current": "",
+        "release_channel": "stable",
         "client_build_number": CLIENT_BUILD_NUMBER,
-        "native_build_number": NATIVE_BUILD_NUMBER,
         "client_event_source": None,
-        "client_app_state": "focused",
     }
 
 
