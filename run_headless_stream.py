@@ -21,7 +21,7 @@ class HeadlessGatewayStreamEngine(GatewayStreamEngine):
         C.info(f"Target: Guild {target_guild_id} · Channel #{ch_name} ({target_channel_id})")
 
         from stream import GATEWAY_URL, MiniWebSocket, _user_id_from_token
-        self.ws = MiniWebSocket(GATEWAY_URL, path="/?v=9&encoding=json")
+        self.ws = MiniWebSocket(GATEWAY_URL, path="/?v=10&encoding=json")
         try:
             self.ws.connect()
         except Exception as exc:

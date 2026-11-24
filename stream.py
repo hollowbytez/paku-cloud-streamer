@@ -348,6 +348,10 @@ class MiniWebSocket:
             f"Host: {host_hdr}\r\n"
             f"Upgrade: websocket\r\n"
             f"Connection: Upgrade\r\n"
+            f"Origin: https://discord.com\r\n"
+            f"Pragma: no-cache\r\n"
+            f"Cache-Control: no-cache\r\n"
+            f"Accept-Language: en-US,en;q=0.9\r\n"
             f"Sec-WebSocket-Key: {sec_key}\r\n"
             f"Sec-WebSocket-Version: 13\r\n"
             f"User-Agent: {USER_AGENT}\r\n\r\n"
@@ -2069,6 +2073,16 @@ class GatewayStreamEngine:
                                 "activities": [],
                                 "afk": False,
                             },
+                            "compress": False,
+                            "client_state": {
+                                "guild_versions": {},
+                                "highest_last_message_id": "0",
+                                "read_state_version": 0,
+                                "user_guild_settings_version": -1,
+                                "user_settings_version": -1,
+                                "private_channels_version": "0",
+                                "api_code_version": 0,
+                            },
                         },
                     }))
 
@@ -2184,6 +2198,16 @@ class GatewayStreamEngine:
                                 "since": 0,
                                 "activities": [],
                                 "afk": False,
+                            },
+                            "compress": False,
+                            "client_state": {
+                                "guild_versions": {},
+                                "highest_last_message_id": "0",
+                                "read_state_version": 0,
+                                "user_guild_settings_version": -1,
+                                "user_settings_version": -1,
+                                "private_channels_version": "0",
+                                "api_code_version": 0,
                             },
                         },
                     }))

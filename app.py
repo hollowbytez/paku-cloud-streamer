@@ -211,7 +211,7 @@ class HealthAndControlHandler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "service": "paku-cloud-streamer",
-                    "version": "2.1.0-clean-browser",
+                    "version": "2.2.0-v10-browser",
                     "status": "online",
                     "bridge_connected": daemon.bridge_connected,
                     "streaming": daemon.is_streaming,
