@@ -1,21 +1,13 @@
-FROM python:3.11-slim
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    curl \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+FROM node:22-slim
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 
-COPY . .
+COPY server.mjs ./
 
-ENV PORT=10000 \
-    PYTHONUNBUFFERED=1
-
+ENV PORT=10000
 EXPOSE 10000
 
-CMD ["python", "app.py"]
+CMD ["node", "server.mjs"]

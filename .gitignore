@@ -1,6 +1,3 @@
-__pycache__/
-*.py[cod]
-*$py.class
-*.log
+node_modules/
 .env
-.DS_Store
+*.log

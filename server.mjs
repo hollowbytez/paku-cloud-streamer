@@ -1,0 +1,1091 @@
+import crypto from "node:crypto";
+import dgram from "node:dgram";
+import http from "node:http";
+import tls from "node:tls";
+import WebSocket from "ws";
+
+const PORT = Number(process.env.PORT || 10000);
+const SECRET = (process.env.EGRESS_RELAY_SECRET || "").trim();
+
+if (!SECRET) {
+  console.error("EGRESS_RELAY_SECRET is required.");
+  process.exit(1);
+}
+
+const activeStreams = new Map();
+const identifyHistory = new Map();
+const startedAtMs = Date.now();
+const DEFAULT_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
+
+function allowIdentifyForAccount(accountId) {
+  const now = Math.floor(Date.now() / 1000);
+  const windowSec = 900;
+  const stamps = (identifyHistory.get(accountId) || []).filter((t) => now - t < windowSec);
+  if (stamps.length >= 2) {
+    identifyHistory.set(accountId, stamps);
+    return false;
+  }
+  stamps.push(now);
+  identifyHistory.set(accountId, stamps);
+  return true;
+}
+
+function openDiscordWs(url, userAgent, cookieJar) {
+  const headers = {
+    Origin: "https://discord.com",
+    "User-Agent": userAgent || DEFAULT_UA,
+    "Accept-Language": "en-US,en;q=0.9",
+    Pragma: "no-cache",
+    "Cache-Control": "no-cache",
+  };
+  if (cookieJar) {
+    headers.Cookie = cookieJar;
+  }
+  return new WebSocket(url, { headers });
+}
+
+function constantTimeHexEqual(a, b) {
+  if (!a || !b || a.length !== b.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(Buffer.from(a, "utf8"), Buffer.from(b, "utf8"));
+}
+
+function verifySignature(timestamp, payload, providedHex) {
+  const ts = Number(timestamp);
+  if (!Number.isFinite(ts)) {
+    return false;
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - ts) > 60) {
+    return false;
+  }
+  const expected = crypto
+    .createHmac("sha256", SECRET)
+    .update(`${timestamp}.${payload}`)
+    .digest("hex");
+  return constantTimeHexEqual(providedHex.toLowerCase(), expected.toLowerCase());
+}
+
+export function isAllowedHttpTarget(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "https:") {
+      return false;
+    }
+    return parsed.hostname === "discord.com" || parsed.hostname.endsWith(".discord.com");
+  } catch {
+    return false;
+  }
+}
+
+export function isAllowedWsTarget(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "wss:") {
+      return null;
+    }
+    const h = parsed.hostname;
+    const valid =
+      h === "gateway.discord.gg" ||
+      h.endsWith(".discord.gg") ||
+      h.endsWith(".discord.media") ||
+      h === "discord.com";
+    if (!valid) {
+      return null;
+    }
+    return {
+      host: parsed.hostname,
+      port: Number(parsed.port || 443),
+      path: `${parsed.pathname || "/"}${parsed.search || ""}`,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function normalizeEndpointUrl(endpoint, query) {
+  let clean = String(endpoint || "")
+    .replace(/^wss?:\/\//i, "")
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/+$/, "");
+  if (!clean.includes(":")) {
+    clean = `${clean}:443`;
+  }
+  return `wss://${clean}/${query}`;
+}
+
+function discoverUdpEndpoint(ip, port, ssrc) {
+  return new Promise((resolve) => {
+    const sock = dgram.createSocket("udp4");
+    let settled = false;
+    const done = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ sock, ...result });
+    };
+
+    const timer = setTimeout(() => {
+      done({ address: "127.0.0.1", port: 1234 });
+    }, 2000);
+
+    sock.on("error", () => {
+      done({ address: "127.0.0.1", port: 1234 });
+    });
+
+    sock.once("message", (msg) => {
+      if (msg.length >= 74 && msg.readUInt16BE(0) === 2) {
+        const nullIdx = msg.indexOf(0, 8);
+        const end = nullIdx > 8 && nullIdx < 72 ? nullIdx : 72;
+        const address = msg.subarray(8, end).toString("utf8").trim() || "127.0.0.1";
+        const extPort = msg.readUInt16BE(72) || 1234;
+        done({ address, port: extPort });
+        return;
+      }
+      done({ address: "127.0.0.1", port: 1234 });
+    });
+
+    const packet = Buffer.alloc(74);
+    packet.writeUInt16BE(1, 0);
+    packet.writeUInt16BE(70, 2);
+    packet.writeUInt32BE(ssrc >>> 0, 4);
+    sock.send(packet, port, ip, (err) => {
+      if (err) {
+        done({ address: "127.0.0.1", port: 1234 });
+      }
+    });
+  });
+}
+
+function pickAeadMode(modes) {
+  if (!Array.isArray(modes)) {
+    return "aead_aes256_gcm_rtpsize";
+  }
+  if (modes.includes("aead_aes256_gcm_rtpsize")) {
+    return "aead_aes256_gcm_rtpsize";
+  }
+  if (modes.includes("aead_xchacha20_poly1305_rtpsize")) {
+    return "aead_xchacha20_poly1305_rtpsize";
+  }
+  return modes[0] || "aead_aes256_gcm_rtpsize";
+}
+
+function sendUdpKeepalive(sock, ip, port, seq = 0) {
+  try {
+    const keepalive = Buffer.alloc(8);
+    keepalive.writeBigUInt64LE(BigInt(seq >>> 0), 0);
+    sock.send(keepalive, port, ip);
+  } catch {
+  }
+}
+
+function buildSuperPropertiesBase64(properties) {
+  return Buffer.from(JSON.stringify(properties || {})).toString("base64");
+}
+
+class CloudStreamSession {
+  constructor(params) {
+    this.params = params;
+    this.accountId = String(params.accountId);
+    this.fenceToken = Number(params.fenceToken);
+    this.streamKey = `guild:${params.guildId}:${params.channelId}:${this.accountId}`;
+    this.stopped = false;
+    this.phase = "connecting";
+    this.lastError = null;
+    this.fatal = false;
+    this.startedAtMs = Date.now();
+    this.expiresAtMs = this.startedAtMs + Math.max(3600, Math.floor(Number(params.durationHours || 4) * 3600)) * 1000;
+    this.mainWs = null;
+    this.voiceWs = null;
+    this.rtcWs = null;
+    this.voiceUdp = null;
+    this.rtcUdp = null;
+    this.timers = [];
+    this.gatewaySessionId = null;
+    this.resumeGatewayUrl = null;
+    this.lastSeq = null;
+    this.analyticsToken = params.analyticsToken || null;
+    this.scienceSeq = 1;
+    this.rtcServerId = String(params.guildId);
+    this.voiceSessionId = "";
+    this.voiceEndpoint = "";
+    this.voiceToken = "";
+    this.activeVoiceSig = "";
+    this.streamAnnounced = false;
+    this.streamRecreates = 0;
+    this.reconnectCount = 0;
+    this.keepaliveSeq = 0;
+  }
+
+  start() {
+    const durationMs = Math.max(60_000, this.expiresAtMs - Date.now());
+    const expTimer = setTimeout(() => {
+      this.stop("Stream duration reached");
+    }, durationMs);
+    this.timers.push(expTimer);
+
+    const hbScience = setInterval(() => {
+      if (!this.stopped && this.phase === "live") {
+        const elapsedMs = Math.max(60_000, Date.now() - this.startedAtMs);
+        this.emitScience("video_stream_heartbeat", elapsedMs).catch(() => {});
+      }
+    }, 60_000);
+    this.timers.push(hbScience);
+
+    this.connectGateway(false);
+  }
+
+  clearTimers() {
+    for (const t of this.timers) {
+      clearTimeout(t);
+      clearInterval(t);
+    }
+    this.timers = [];
+  }
+
+  closeSockets(sendLeave) {
+    if (sendLeave && this.mainWs && this.mainWs.readyState === WebSocket.OPEN) {
+      try {
+        this.mainWs.send(JSON.stringify({ op: 19, d: { stream_key: this.streamKey } }));
+        this.mainWs.send(
+          JSON.stringify({
+            op: 4,
+            d: {
+              guild_id: String(this.params.guildId),
+              channel_id: null,
+              self_mute: false,
+              self_deaf: false,
+              self_video: false,
+            },
+          })
+        );
+      } catch {
+      }
+    }
+    for (const ws of [this.rtcWs, this.voiceWs, this.mainWs]) {
+      try {
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+          ws.close(1000, "closed");
+        }
+      } catch {
+      }
+    }
+    for (const sock of [this.rtcUdp, this.voiceUdp]) {
+      try {
+        sock?.close();
+      } catch {
+      }
+    }
+    this.rtcWs = null;
+    this.voiceWs = null;
+    this.mainWs = null;
+    this.rtcUdp = null;
+    this.voiceUdp = null;
+  }
+
+  stop(reason = "Stopped", fatal = false) {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.phase = "stopped";
+    this.lastError = reason;
+    this.fatal = fatal;
+    this.clearTimers();
+    this.closeSockets(true);
+    if (activeStreams.get(this.accountId) === this) {
+      activeStreams.delete(this.accountId);
+    }
+  }
+
+  status() {
+    return {
+      active: !this.stopped,
+      phase: this.phase,
+      lastError: this.lastError,
+      fatal: this.fatal,
+      consumedSeconds: Math.max(0, Math.floor((Date.now() - this.startedAtMs) / 1000)),
+      fenceToken: this.fenceToken,
+      gatewayConnected: this.mainWs?.readyState === WebSocket.OPEN,
+      voiceConnected: this.voiceWs?.readyState === WebSocket.OPEN,
+      rtcConnected: this.rtcWs?.readyState === WebSocket.OPEN,
+    };
+  }
+
+  async emitScience(eventType, totalDurationMs) {
+    if (!this.analyticsToken) return;
+    const now = Date.now();
+    const superProps = buildSuperPropertiesBase64(this.params.properties);
+    const headers = {
+      Accept: "*/*",
+      Authorization: this.params.token,
+      "Content-Type": "application/json",
+      "User-Agent": this.params.browserUserAgent || "Mozilla/5.0",
+      Origin: "https://discord.com",
+      Referer: "https://discord.com/channels/@me",
+      "X-Super-Properties": superProps,
+      "X-Discord-Locale": "en-US",
+      "X-Discord-Timezone": "America/New_York",
+    };
+    if (this.params.cookieJar) {
+      headers.Cookie = this.params.cookieJar;
+    }
+    await fetch("https://discord.com/api/v9/science", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        token: this.analyticsToken,
+        events: [
+          {
+            type: eventType,
+            properties: {
+              client_track_timestamp: now,
+              client_send_timestamp: now,
+              client_heartbeat_session_id: this.params.hbSession,
+              launch_signature: this.params.launchSig,
+              event_sequence_number: ++this.scienceSeq,
+              guild_id: String(this.params.guildId),
+              channel_id: String(this.params.channelId),
+              channel_type: 2,
+              total_duration_ms: totalDurationMs,
+              ...(eventType === "video_stream_heartbeat" ? { duration_tracked_ms: 60_000 } : {}),
+            },
+          },
+        ],
+      }),
+      signal: AbortSignal.timeout(8000),
+    }).catch(() => {});
+  }
+
+  connectGateway(isResume) {
+    if (this.stopped) return;
+    this.closeSockets(false);
+    this.activeVoiceSig = "";
+    this.streamAnnounced = false;
+    this.voiceEndpoint = "";
+    this.voiceToken = "";
+
+    const canActuallyResume = Boolean(
+      isResume && this.gatewaySessionId && this.resumeGatewayUrl && this.lastSeq !== null
+    );
+    if (!canActuallyResume && !allowIdentifyForAccount(this.accountId)) {
+      this.stop("Rate safety pause to protect account session", false);
+      return;
+    }
+
+    const endpoint =
+      canActuallyResume && this.resumeGatewayUrl
+        ? normalizeEndpointUrl(this.resumeGatewayUrl, "?v=10&encoding=json")
+        : "wss://gateway.discord.gg/?v=10&encoding=json";
+
+    const ws = openDiscordWs(endpoint, this.params.browserUserAgent, this.params.cookieJar);
+    this.mainWs = ws;
+    let hbInterval = null;
+
+    ws.on("message", (raw) => {
+      if (this.stopped) return;
+      const text = typeof raw === "string" ? raw : raw.toString("utf8");
+      let msg;
+      try {
+        msg = JSON.parse(text);
+      } catch {
+        return;
+      }
+
+      if (msg.s !== undefined && msg.s !== null) {
+        this.lastSeq = msg.s;
+      }
+
+      if (msg.op === 1) {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ op: 1, d: this.lastSeq }));
+        }
+        return;
+      }
+
+      if (msg.op === 7) {
+        try {
+          ws.close(4000, "reconnect");
+        } catch {
+        }
+        return;
+      }
+
+      if (msg.op === 9) {
+        if (!msg.d) {
+          this.gatewaySessionId = null;
+          this.resumeGatewayUrl = null;
+          this.lastSeq = null;
+        }
+        try {
+          ws.close(4000, "invalid");
+        } catch {
+        }
+        return;
+      }
+
+      if (msg.op === 10) {
+        const ms = Number(msg.d?.heartbeat_interval || 41250);
+        hbInterval = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ op: 1, d: this.lastSeq }));
+          }
+        }, Math.floor(ms * 0.85));
+        this.timers.push(hbInterval);
+
+        if (canActuallyResume && this.gatewaySessionId && this.lastSeq !== null) {
+          ws.send(
+            JSON.stringify({
+              op: 6,
+              d: {
+                token: this.params.token,
+                session_id: this.gatewaySessionId,
+                seq: this.lastSeq,
+              },
+            })
+          );
+        } else {
+          ws.send(
+            JSON.stringify({
+              op: 2,
+              d: {
+                token: this.params.token,
+                capabilities: 30717,
+                properties: this.params.properties,
+                presence: this.params.presence || {
+                  status: "online",
+                  since: 0,
+                  activities: [],
+                  afk: false,
+                },
+                compress: false,
+                client_state: {
+                  guild_versions: {},
+                  highest_last_message_id: "0",
+                  read_state_version: 0,
+                  user_guild_settings_version: -1,
+                  user_settings_version: -1,
+                  private_channels_version: "0",
+                  api_code_version: 0,
+                },
+              },
+            })
+          );
+        }
+        return;
+      }
+
+      if (msg.t === "READY") {
+        this.reconnectCount = 0;
+        this.gatewaySessionId = String(msg.d?.session_id || "");
+        this.voiceSessionId = this.gatewaySessionId;
+        if (typeof msg.d?.resume_gateway_url === "string") {
+          this.resumeGatewayUrl = msg.d.resume_gateway_url;
+        }
+        if (typeof msg.d?.analytics_token === "string") {
+          this.analyticsToken = msg.d.analytics_token;
+        }
+        this.joinVoiceRoom();
+        return;
+      }
+
+      if (msg.t === "RESUMED") {
+        this.reconnectCount = 0;
+        this.joinVoiceRoom();
+        return;
+      }
+
+      if (msg.t === "VOICE_STATE_UPDATE" && String(msg.d?.user_id) === this.accountId) {
+        const ch = msg.d?.channel_id ? String(msg.d.channel_id) : "";
+        if (!ch && this.phase === "live") {
+          this.joinVoiceRoom();
+          return;
+        }
+        if (msg.d?.session_id) {
+          this.voiceSessionId = String(msg.d.session_id);
+        }
+        this.maybeStartVoice();
+        return;
+      }
+
+      if (msg.t === "VOICE_SERVER_UPDATE") {
+        this.voiceEndpoint = String(msg.d?.endpoint || "");
+        this.voiceToken = String(msg.d?.token || "");
+        this.maybeStartVoice();
+        return;
+      }
+
+      if (msg.t === "STREAM_CREATE") {
+        if (msg.d?.stream_key) {
+          this.streamKey = String(msg.d.stream_key);
+        }
+        if (msg.d?.rtc_server_id) {
+          this.rtcServerId = String(msg.d.rtc_server_id);
+        }
+        if (!this.streamAnnounced && ws.readyState === WebSocket.OPEN) {
+          this.streamAnnounced = true;
+          ws.send(JSON.stringify({ op: 22, d: { stream_key: this.streamKey, paused: false } }));
+        }
+        return;
+      }
+
+      if (msg.t === "STREAM_DELETE") {
+        if (!this.stopped && this.streamRecreates < 5 && ws.readyState === WebSocket.OPEN) {
+          this.streamRecreates += 1;
+          this.streamAnnounced = false;
+          const retryTimer = setTimeout(() => {
+            if (!this.stopped && this.mainWs && this.mainWs.readyState === WebSocket.OPEN) {
+              this.mainWs.send(
+                JSON.stringify({
+                  op: 18,
+                  d: {
+                    type: "guild",
+                    guild_id: String(this.params.guildId),
+                    channel_id: String(this.params.channelId),
+                    preferred_region: null,
+                  },
+                })
+              );
+            }
+          }, 2000);
+          this.timers.push(retryTimer);
+        }
+        return;
+      }
+
+      if (msg.t === "STREAM_SERVER_UPDATE") {
+        const ep = String(msg.d?.endpoint || "");
+        const stok = String(msg.d?.token || "");
+        if (msg.d?.stream_key) {
+          this.streamKey = String(msg.d.stream_key);
+        }
+        if (ep && stok && this.voiceSessionId) {
+          this.connectStreamRtc(ep, stok);
+        }
+      }
+    });
+
+    ws.on("close", (code) => {
+      if (hbInterval) {
+        clearInterval(hbInterval);
+        hbInterval = null;
+      }
+      if (this.stopped) return;
+      if (code === 4004) {
+        this.stop("TOKEN_INVALID", true);
+        return;
+      }
+      this.reconnectCount += 1;
+      if (this.reconnectCount > 4) {
+        this.stop("Gateway disconnected repeatedly", false);
+        return;
+      }
+      const canResume = Boolean(this.gatewaySessionId && this.resumeGatewayUrl && this.lastSeq !== null);
+      const t = setTimeout(() => {
+        this.connectGateway(canResume);
+      }, 3500 + Math.floor(Math.random() * 1500));
+      this.timers.push(t);
+    });
+
+    ws.on("error", () => {});
+  }
+
+  joinVoiceRoom() {
+    if (this.stopped || !this.mainWs || this.mainWs.readyState !== WebSocket.OPEN) return;
+    this.phase = "voice_joining";
+    this.mainWs.send(
+      JSON.stringify({
+        op: 4,
+        d: {
+          guild_id: String(this.params.guildId),
+          channel_id: String(this.params.channelId),
+          self_mute: false,
+          self_deaf: false,
+          self_video: false,
+        },
+      })
+    );
+  }
+
+  maybeStartVoice() {
+    if (this.stopped || !this.voiceSessionId || !this.voiceEndpoint || !this.voiceToken) {
+      return;
+    }
+    const sig = `${this.voiceEndpoint}:${this.voiceToken}:${this.voiceSessionId}`;
+    if (this.activeVoiceSig === sig && this.voiceWs && this.voiceWs.readyState === WebSocket.OPEN) {
+      return;
+    }
+    this.activeVoiceSig = sig;
+    this.connectRoomVoice();
+  }
+
+  connectRoomVoice() {
+    if (this.stopped) return;
+    if (this.voiceWs) {
+      try {
+        this.voiceWs.close(1000, "reconnecting");
+      } catch {
+      }
+    }
+    if (this.voiceUdp) {
+      try {
+        this.voiceUdp.close();
+      } catch {
+      }
+      this.voiceUdp = null;
+    }
+    const url = normalizeEndpointUrl(this.voiceEndpoint, "?v=8");
+    const vWs = openDiscordWs(url, this.params.browserUserAgent);
+    this.voiceWs = vWs;
+    let hbInterval = null;
+    let keepaliveInterval = null;
+    let ssrc = 1000;
+    let announcedGoLive = false;
+    let voiceSeq = -1;
+
+    vWs.on("message", async (raw, isBinary) => {
+      if (this.stopped) return;
+      if (isBinary) {
+        const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+        if (buf.length >= 2) {
+          voiceSeq = buf.readUInt16BE(0);
+        }
+        return;
+      }
+      let msg;
+      try {
+        msg = JSON.parse(typeof raw === "string" ? raw : raw.toString("utf8"));
+      } catch {
+        return;
+      }
+      if (typeof msg.seq === "number") {
+        voiceSeq = msg.seq;
+      }
+
+      if (msg.op === 8) {
+        const hbMs = Number(msg.d?.heartbeat_interval || 13750);
+        hbInterval = setInterval(() => {
+          if (vWs.readyState === WebSocket.OPEN) {
+            vWs.send(JSON.stringify({ op: 3, d: { t: Date.now(), seq_ack: voiceSeq } }));
+          }
+        }, Math.floor(hbMs * 0.85));
+        this.timers.push(hbInterval);
+
+        vWs.send(
+          JSON.stringify({
+            op: 0,
+            d: {
+              server_id: String(this.params.guildId),
+              user_id: this.accountId,
+              session_id: this.voiceSessionId,
+              token: this.voiceToken,
+              max_dave_protocol_version: 1,
+            },
+          })
+        );
+      } else if (msg.op === 2) {
+        ssrc = Number(msg.d?.ssrc || 1000);
+        const ip = String(msg.d?.ip || "127.0.0.1");
+        const port = Number(msg.d?.port || 1234);
+        const mode = pickAeadMode(msg.d?.modes);
+        const udp = await discoverUdpEndpoint(ip, port, ssrc);
+        if (this.stopped) {
+          udp.sock.close();
+          return;
+        }
+        this.voiceUdp = udp.sock;
+        sendUdpKeepalive(udp.sock, ip, port, ++this.keepaliveSeq);
+        keepaliveInterval = setInterval(
+          () => sendUdpKeepalive(udp.sock, ip, port, ++this.keepaliveSeq),
+          5_000
+        );
+        this.timers.push(keepaliveInterval);
+
+        vWs.send(
+          JSON.stringify({
+            op: 1,
+            d: {
+              protocol: "udp",
+              data: { address: udp.address, port: udp.port, mode },
+              codecs: [{ name: "opus", type: "audio", priority: 1000, payload_type: 120 }],
+            },
+          })
+        );
+      } else if (msg.op === 4) {
+        vWs.send(JSON.stringify({ op: 5, d: { speaking: 0, delay: 0, ssrc } }));
+        if (!announcedGoLive && this.mainWs && this.mainWs.readyState === WebSocket.OPEN) {
+          announcedGoLive = true;
+          this.mainWs.send(
+            JSON.stringify({
+              op: 18,
+              d: {
+                type: "guild",
+                guild_id: String(this.params.guildId),
+                channel_id: String(this.params.channelId),
+                preferred_region: null,
+              },
+            })
+          );
+        }
+      }
+    });
+
+    vWs.on("close", () => {
+      if (hbInterval) clearInterval(hbInterval);
+      if (keepaliveInterval) clearInterval(keepaliveInterval);
+    });
+    vWs.on("error", () => {});
+  }
+
+  connectStreamRtc(endpoint, streamToken) {
+    if (this.stopped) return;
+    if (this.rtcWs) {
+      try {
+        this.rtcWs.close(1000, "restarting");
+      } catch {
+      }
+    }
+    if (this.rtcUdp) {
+      try {
+        this.rtcUdp.close();
+      } catch {
+      }
+      this.rtcUdp = null;
+    }
+
+    const url = normalizeEndpointUrl(endpoint, "?v=8");
+    const sWs = openDiscordWs(url, this.params.browserUserAgent);
+    this.rtcWs = sWs;
+    let hbInterval = null;
+    let keepaliveInterval = null;
+    let ssrc = 2000;
+    let videoSsrc = 2001;
+    let rtcSeq = -1;
+
+    sWs.on("message", async (raw, isBinary) => {
+      if (this.stopped) return;
+      if (isBinary) {
+        const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+        if (buf.length >= 2) {
+          rtcSeq = buf.readUInt16BE(0);
+        }
+        return;
+      }
+      let msg;
+      try {
+        msg = JSON.parse(typeof raw === "string" ? raw : raw.toString("utf8"));
+      } catch {
+        return;
+      }
+      if (typeof msg.seq === "number") {
+        rtcSeq = msg.seq;
+      }
+
+      if (msg.op === 8) {
+        const hbMs = Number(msg.d?.heartbeat_interval || 13750);
+        hbInterval = setInterval(() => {
+          if (sWs.readyState === WebSocket.OPEN) {
+            sWs.send(JSON.stringify({ op: 3, d: { t: Date.now(), seq_ack: rtcSeq } }));
+          }
+        }, Math.floor(hbMs * 0.85));
+        this.timers.push(hbInterval);
+
+        sWs.send(
+          JSON.stringify({
+            op: 0,
+            d: {
+              server_id: this.rtcServerId,
+              channel_id: String(this.params.channelId),
+              user_id: this.accountId,
+              session_id: this.voiceSessionId,
+              token: streamToken,
+              stream_key: this.streamKey,
+              video: true,
+              streams: [{ type: "screen", rid: "100", quality: 100 }],
+              max_dave_protocol_version: 1,
+            },
+          })
+        );
+      } else if (msg.op === 2) {
+        ssrc = Number(msg.d?.ssrc || 2000);
+        const streams = Array.isArray(msg.d?.streams) ? msg.d.streams : [];
+        videoSsrc = Number(streams[0]?.ssrc || ssrc + 1);
+        const ip = String(msg.d?.ip || "127.0.0.1");
+        const port = Number(msg.d?.port || 1234);
+        const mode = pickAeadMode(msg.d?.modes);
+        const udp = await discoverUdpEndpoint(ip, port, ssrc);
+        if (this.stopped) {
+          udp.sock.close();
+          return;
+        }
+        this.rtcUdp = udp.sock;
+        sendUdpKeepalive(udp.sock, ip, port, ++this.keepaliveSeq);
+        keepaliveInterval = setInterval(
+          () => sendUdpKeepalive(udp.sock, ip, port, ++this.keepaliveSeq),
+          5_000
+        );
+        this.timers.push(keepaliveInterval);
+
+        sWs.send(
+          JSON.stringify({
+            op: 1,
+            d: {
+              protocol: "udp",
+              data: { address: udp.address, port: udp.port, mode },
+              codecs: [
+                { name: "opus", type: "audio", priority: 1000, payload_type: 120 },
+                {
+                  name: "H264",
+                  type: "video",
+                  priority: 1000,
+                  payload_type: 101,
+                  rtx_payload_type: 102,
+                  encode: true,
+                  decode: true,
+                },
+              ],
+            },
+          })
+        );
+      } else if (msg.op === 4) {
+        sWs.send(JSON.stringify({ op: 5, d: { speaking: 2, delay: 0, ssrc } }));
+        sWs.send(
+          JSON.stringify({
+            op: 12,
+            d: {
+              audio_ssrc: ssrc,
+              video_ssrc: videoSsrc,
+              rtx_ssrc: videoSsrc + 1,
+              streams: [
+                {
+                  type: "video",
+                  rid: "100",
+                  ssrc: videoSsrc,
+                  rtx_ssrc: videoSsrc + 1,
+                  quality: 100,
+                  active: true,
+                  max_bitrate: 2500000,
+                  max_framerate: 30,
+                  max_resolution: { type: "fixed", width: 1280, height: 720 },
+                },
+              ],
+            },
+          })
+        );
+        this.phase = "live";
+        this.emitScience("media_session_joined", 0).catch(() => {});
+        this.emitScience("video_stream_started", 0).catch(() => {});
+      }
+    });
+
+    sWs.on("close", () => {
+      if (hbInterval) clearInterval(hbInterval);
+      if (keepaliveInterval) clearInterval(keepaliveInterval);
+    });
+    sWs.on("error", () => {});
+  }
+}
+
+async function readJsonBody(req) {
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of req) {
+    total += chunk.length;
+    if (total > 1024 * 1024) {
+      throw Object.assign(new Error("Payload too large"), { statusCode: 413 });
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url || "/", "http://localhost");
+
+  if (url.pathname === "/health" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        ok: true,
+        activeStreams: activeStreams.size,
+        uptimeSec: Math.floor((Date.now() - startedAtMs) / 1000),
+      })
+    );
+    return;
+  }
+
+  if (url.pathname === "/stream/status" && req.method === "GET") {
+    const accountId = String(url.searchParams.get("accountId") || "");
+    const ts = String(req.headers["x-paku-timestamp"] || "");
+    const sig = String(req.headers["x-paku-signature"] || "");
+    if (!accountId || !verifySignature(ts, `status:${accountId}`, sig)) {
+      res.writeHead(401);
+      res.end();
+      return;
+    }
+    const existing = activeStreams.get(accountId);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify(
+        existing
+          ? existing.status()
+          : {
+              active: false,
+              phase: "idle",
+              lastError: null,
+              fatal: false,
+              consumedSeconds: 0,
+            }
+      )
+    );
+    return;
+  }
+
+  if (req.method !== "POST") {
+    res.writeHead(404);
+    res.end();
+    return;
+  }
+
+  let rawBody;
+  try {
+    rawBody = await readJsonBody(req);
+  } catch (err) {
+    res.writeHead(err.statusCode || 400);
+    res.end();
+    return;
+  }
+
+  const ts = String(req.headers["x-paku-timestamp"] || "");
+  const sig = String(req.headers["x-paku-signature"] || "");
+  if (!verifySignature(ts, rawBody, sig)) {
+    res.writeHead(401);
+    res.end();
+    return;
+  }
+
+  let job;
+  try {
+    job = JSON.parse(rawBody);
+  } catch {
+    res.writeHead(400);
+    res.end();
+    return;
+  }
+
+  if (url.pathname === "/stream/start") {
+    if (!job?.accountId || !job?.guildId || !job?.channelId || !job?.token) {
+      res.writeHead(400);
+      res.end();
+      return;
+    }
+    const prior = activeStreams.get(String(job.accountId));
+    if (prior) {
+      prior.stop("Superseded by new stream");
+    }
+    const session = new CloudStreamSession(job);
+    activeStreams.set(session.accountId, session);
+    session.start();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, status: "starting", streamKey: session.streamKey }));
+    return;
+  }
+
+  if (url.pathname === "/stream/stop") {
+    const accountId = String(job?.accountId || "");
+    const existing = activeStreams.get(accountId);
+    if (existing && (job.fenceToken === undefined || existing.fenceToken === Number(job.fenceToken))) {
+      existing.stop(String(job.reason || "Stopped"));
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  if (url.pathname !== "/forward") {
+    res.writeHead(404);
+    res.end();
+    return;
+  }
+
+  if (!job?.url || !isAllowedHttpTarget(job.url)) {
+    res.writeHead(403);
+    res.end();
+    return;
+  }
+
+  try {
+    const upstream = await fetch(job.url, {
+      method: String(job.method || "GET").toUpperCase(),
+      headers: job.headers || {},
+      body: job.body ?? undefined,
+      signal: AbortSignal.timeout(14_000),
+    });
+    const setCookies =
+      typeof upstream.headers.getSetCookie === "function" ? upstream.headers.getSetCookie() : [];
+    const text = await upstream.text();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: upstream.status, setCookies, text }));
+  } catch {
+    res.writeHead(502, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: 502, setCookies: [], text: "" }));
+  }
+});
+
+server.on("upgrade", (req, socket, head) => {
+  if (!req.url?.startsWith("/ws")) {
+    socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  const targetRaw = String(req.headers["x-paku-target"] || "");
+  const ts = String(req.headers["x-paku-timestamp"] || "");
+  const sig = String(req.headers["x-paku-signature"] || "");
+  const target = isAllowedWsTarget(targetRaw);
+
+  if (!target || !verifySignature(ts, targetRaw, sig)) {
+    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  const wsKey = String(req.headers["sec-websocket-key"] || crypto.randomBytes(16).toString("base64")).replace(/[\r\n]/g, "");
+  const ua = String(req.headers["x-paku-ua"] || "Mozilla/5.0").replace(/[\r\n]/g, "");
+  const cookie = String(req.headers["x-paku-cookie"] || "").replace(/[\r\n]/g, "");
+
+  const upstream = tls.connect({ host: target.host, port: target.port, servername: target.host }, () => {
+    const lines = [
+      `GET ${target.path} HTTP/1.1`,
+      `Host: ${target.port === 443 ? target.host : `${target.host}:${target.port}`}`,
+      "Upgrade: websocket",
+      "Connection: Upgrade",
+      `Sec-WebSocket-Key: ${wsKey}`,
+      "Sec-WebSocket-Version: 13",
+      "Origin: https://discord.com",
+      `User-Agent: ${ua}`,
+    ];
+    if (cookie) {
+      lines.push(`Cookie: ${cookie}`);
+    }
+    upstream.write(`${lines.join("\r\n")}\r\n\r\n`);
+    if (head?.length) {
+      upstream.write(head);
+    }
+    upstream.pipe(socket);
+    socket.pipe(upstream);
+  });
+
+  const killBoth = () => {
+    upstream.destroy();
+    socket.destroy();
+  };
+  upstream.on("error", killBoth);
+  socket.on("error", killBoth);
+  upstream.on("close", () => socket.end());
+  socket.on("close", () => upstream.end());
+});
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Paku Render cloud engine listening on port ${PORT}`);
+});

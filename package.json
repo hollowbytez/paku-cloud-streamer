@@ -1,0 +1,16 @@
+{
+  "name": "paku-render",
+  "version": "1.0.0",
+  "description": "Paku cloud stream and egress service",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.23.0"
+  }
+}
