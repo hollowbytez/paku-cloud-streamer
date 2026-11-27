@@ -181,6 +181,33 @@ function sendUdpKeepalive(sock, ip, port, seq = 0) {
   }
 }
 
+function sendEncryptedOpusSilence(sock, ip, port, secretKey, ssrc, state) {
+  if (!sock || !secretKey || secretKey.length !== 32) {
+    return;
+  }
+  try {
+    const rtp = Buffer.alloc(12);
+    rtp[0] = 0x80;
+    rtp[1] = 120;
+    rtp.writeUInt16BE(state.seq & 0xffff, 2);
+    rtp.writeUInt32BE(state.ts >>> 0, 4);
+    rtp.writeUInt32BE(ssrc >>> 0, 8);
+    const nonce = Buffer.alloc(12);
+    nonce.writeUInt32BE(state.nonce >>> 0, 0);
+    const cipher = crypto.createCipheriv("aes-256-gcm", secretKey, nonce);
+    cipher.setAAD(rtp);
+    const encrypted = Buffer.concat([cipher.update(Buffer.from([0xf8, 0xff, 0xfe])), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    const tail = Buffer.alloc(4);
+    tail.writeUInt32BE(state.nonce >>> 0, 0);
+    sock.send(Buffer.concat([rtp, encrypted, tag, tail]), port, ip);
+    state.seq = (state.seq + 1) & 0xffff;
+    state.ts = (state.ts + 960) >>> 0;
+    state.nonce = (state.nonce + 1) >>> 0;
+  } catch {
+  }
+}
+
 function buildSuperPropertiesBase64(properties) {
   return Buffer.from(JSON.stringify(properties || {})).toString("base64");
 }
@@ -217,6 +244,14 @@ class CloudStreamSession {
     this.streamRecreates = 0;
     this.reconnectCount = 0;
     this.keepaliveSeq = 0;
+    this.voiceMembers = new Set();
+    this.streamViewers = new Set();
+  }
+
+  getViewerCount() {
+    const combined = new Set([...this.voiceMembers, ...this.streamViewers]);
+    combined.delete(this.accountId);
+    return combined.size;
   }
 
   start() {
@@ -309,6 +344,7 @@ class CloudStreamSession {
       gatewayConnected: this.mainWs?.readyState === WebSocket.OPEN,
       voiceConnected: this.voiceWs?.readyState === WebSocket.OPEN,
       rtcConnected: this.rtcWs?.readyState === WebSocket.OPEN,
+      viewerCount: this.getViewerCount(),
     };
   }
 
@@ -485,6 +521,17 @@ class CloudStreamSession {
         if (typeof msg.d?.analytics_token === "string") {
           this.analyticsToken = msg.d.analytics_token;
         }
+        const targetGuild = Array.isArray(msg.d?.guilds)
+          ? msg.d.guilds.find((g) => String(g.id) === String(this.params.guildId))
+          : null;
+        if (targetGuild && Array.isArray(targetGuild.voice_states)) {
+          this.voiceMembers.clear();
+          for (const vs of targetGuild.voice_states) {
+            if (String(vs.channel_id) === String(this.params.channelId) && String(vs.user_id) !== this.accountId) {
+              this.voiceMembers.add(String(vs.user_id));
+            }
+          }
+        }
         this.joinVoiceRoom();
         return;
       }
@@ -495,16 +542,27 @@ class CloudStreamSession {
         return;
       }
 
-      if (msg.t === "VOICE_STATE_UPDATE" && String(msg.d?.user_id) === this.accountId) {
+      if (msg.t === "VOICE_STATE_UPDATE") {
+        const uid = String(msg.d?.user_id || "");
         const ch = msg.d?.channel_id ? String(msg.d.channel_id) : "";
-        if (!ch && this.phase === "live") {
-          this.joinVoiceRoom();
-          return;
+        const gId = msg.d?.guild_id ? String(msg.d.guild_id) : "";
+        if (uid && uid !== this.accountId && gId === String(this.params.guildId)) {
+          if (ch === String(this.params.channelId)) {
+            this.voiceMembers.add(uid);
+          } else {
+            this.voiceMembers.delete(uid);
+          }
         }
-        if (msg.d?.session_id) {
-          this.voiceSessionId = String(msg.d.session_id);
+        if (uid === this.accountId) {
+          if (!ch && this.phase === "live") {
+            this.joinVoiceRoom();
+            return;
+          }
+          if (msg.d?.session_id) {
+            this.voiceSessionId = String(msg.d.session_id);
+          }
+          this.maybeStartVoice();
         }
-        this.maybeStartVoice();
         return;
       }
 
@@ -515,16 +573,21 @@ class CloudStreamSession {
         return;
       }
 
-      if (msg.t === "STREAM_CREATE") {
-        if (msg.d?.stream_key) {
+      if (msg.t === "STREAM_CREATE" || msg.t === "STREAM_UPDATE") {
+        if (msg.d?.stream_key && String(msg.d.stream_key).includes(this.accountId)) {
           this.streamKey = String(msg.d.stream_key);
+          if (Array.isArray(msg.d?.viewer_ids)) {
+            this.streamViewers = new Set(msg.d.viewer_ids.map(String));
+          }
         }
-        if (msg.d?.rtc_server_id) {
-          this.rtcServerId = String(msg.d.rtc_server_id);
-        }
-        if (!this.streamAnnounced && ws.readyState === WebSocket.OPEN) {
-          this.streamAnnounced = true;
-          ws.send(JSON.stringify({ op: 22, d: { stream_key: this.streamKey, paused: false } }));
+        if (msg.t === "STREAM_CREATE") {
+          if (msg.d?.rtc_server_id) {
+            this.rtcServerId = String(msg.d.rtc_server_id);
+          }
+          if (!this.streamAnnounced && ws.readyState === WebSocket.OPEN) {
+            this.streamAnnounced = true;
+            ws.send(JSON.stringify({ op: 22, d: { stream_key: this.streamKey, paused: false } }));
+          }
         }
         return;
       }
@@ -819,11 +882,15 @@ class CloudStreamSession {
           return;
         }
         this.rtcUdp = udp.sock;
+        let secretKey = null;
+        const rtpState = { seq: 1, ts: 960, nonce: 1 };
         sendUdpKeepalive(udp.sock, ip, port, ++this.keepaliveSeq);
-        keepaliveInterval = setInterval(
-          () => sendUdpKeepalive(udp.sock, ip, port, ++this.keepaliveSeq),
-          5_000
-        );
+        keepaliveInterval = setInterval(() => {
+          sendUdpKeepalive(udp.sock, ip, port, ++this.keepaliveSeq);
+          if (secretKey) {
+            sendEncryptedOpusSilence(udp.sock, ip, port, secretKey, ssrc, rtpState);
+          }
+        }, 2_000);
         this.timers.push(keepaliveInterval);
 
         sWs.send(
@@ -847,7 +914,13 @@ class CloudStreamSession {
             },
           })
         );
+        sWs._setKey = (k) => {
+          secretKey = k;
+        };
       } else if (msg.op === 4) {
+        if (Array.isArray(msg.d?.secret_key) && msg.d.secret_key.length === 32 && typeof sWs._setKey === "function") {
+          sWs._setKey(Buffer.from(msg.d.secret_key));
+        }
         sWs.send(JSON.stringify({ op: 5, d: { speaking: 2, delay: 0, ssrc } }));
         sWs.send(
           JSON.stringify({
