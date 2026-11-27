@@ -6,6 +6,8 @@ import WebSocket from "ws";
 
 const PORT = Number(process.env.PORT || 10000);
 const SECRET = (process.env.EGRESS_RELAY_SECRET || "").trim();
+const DEFAULT_WEBHOOK_URL = (process.env.PAKU_WEBHOOK_URL || "").trim();
+const DEFAULT_VIEWER_TOKEN = (process.env.ALT_VIEWER_TOKEN || "").trim();
 
 if (!SECRET) {
   console.error("EGRESS_RELAY_SECRET is required.");
@@ -15,8 +17,36 @@ if (!SECRET) {
 const activeStreams = new Map();
 const identifyHistory = new Map();
 const startedAtMs = Date.now();
+let lastKnownWebhookUrl = DEFAULT_WEBHOOK_URL;
 const DEFAULT_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
+
+function signRelayPayloadSync(timestamp, body) {
+  return crypto
+    .createHmac("sha256", SECRET)
+    .update(`${timestamp}.${body}`)
+    .digest("hex");
+}
+
+function sendRelayWebhook(webhookUrl, payload) {
+  const url = String(webhookUrl || lastKnownWebhookUrl || "").trim();
+  if (!url || !url.startsWith("https://")) {
+    return Promise.resolve();
+  }
+  const body = JSON.stringify(payload);
+  const ts = String(Math.floor(Date.now() / 1000));
+  const sig = signRelayPayloadSync(ts, body);
+  return fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Paku-Timestamp": ts,
+      "X-Paku-Signature": sig,
+    },
+    body,
+    signal: AbortSignal.timeout(5000),
+  }).catch(() => {});
+}
 
 function allowIdentifyForAccount(accountId) {
   const now = Math.floor(Date.now() / 1000);
@@ -212,12 +242,322 @@ function buildSuperPropertiesBase64(properties) {
   return Buffer.from(JSON.stringify(properties || {})).toString("base64");
 }
 
+function extractSnowflakeFromToken(token) {
+  try {
+    const clean = String(token || "").trim().replace(/^Bot\s+/i, "").replace(/"/g, "");
+    const first = clean.split(".")[0];
+    if (!first) return "";
+    const norm = first.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = norm + "=".repeat((4 - (norm.length % 4)) % 4);
+    const decoded = Buffer.from(padded, "base64").toString("utf8");
+    return /^\d{17,20}$/.test(decoded) ? decoded : "";
+  } catch {
+    return "";
+  }
+}
+
+class AltViewerSession {
+  constructor({ token, guildId, channelId, streamKey, userAgent, properties, onStatusChange }) {
+    this.token = String(token || "").trim();
+    this.guildId = String(guildId);
+    this.channelId = String(channelId);
+    this.streamKey = String(streamKey);
+    this.userAgent = userAgent || DEFAULT_UA;
+    this.properties = properties || { os: "Windows", browser: "Discord Client", release_channel: "stable" };
+    this.onStatusChange = typeof onStatusChange === "function" ? onStatusChange : () => {};
+    this.userId = extractSnowflakeFromToken(this.token);
+    this.stopped = false;
+    this.connected = false;
+    this.fatal = false;
+    this.mainWs = null;
+    this.roomVoiceWs = null;
+    this.watchRtcWs = null;
+    this.roomUdp = null;
+    this.watchUdp = null;
+    this.timers = [];
+    this.sessionId = "";
+    this.lastSeq = null;
+    this.watched = false;
+    this.watchRequested = false;
+    this.keepaliveSeq = 0;
+  }
+
+  start() {
+    if (this.stopped || !this.token) return;
+    const ws = openDiscordWs("wss://gateway.discord.gg/?v=10&encoding=json", this.userAgent);
+    this.mainWs = ws;
+    let hbInterval = null;
+
+    ws.on("message", (raw) => {
+      if (this.stopped) return;
+      let msg;
+      try {
+        msg = JSON.parse(typeof raw === "string" ? raw : raw.toString("utf8"));
+      } catch {
+        return;
+      }
+      if (msg.s !== undefined && msg.s !== null) {
+        this.lastSeq = msg.s;
+      }
+      if (msg.op === 1 && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ op: 1, d: this.lastSeq }));
+        return;
+      }
+      if (msg.op === 10) {
+        const ms = Number(msg.d?.heartbeat_interval || 41250);
+        hbInterval = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ op: 1, d: this.lastSeq }));
+          }
+        }, Math.floor(ms * 0.85));
+        this.timers.push(hbInterval);
+        ws.send(
+          JSON.stringify({
+            op: 2,
+            d: {
+              token: this.token,
+              capabilities: 30717,
+              properties: this.properties,
+              presence: { status: "online", since: 0, activities: [], afk: false },
+              compress: false,
+              client_state: { guild_versions: {} },
+            },
+          })
+        );
+        return;
+      }
+      if (msg.t === "READY") {
+        this.sessionId = String(msg.d?.session_id || "");
+        if (msg.d?.user?.id) {
+          this.userId = String(msg.d.user.id);
+        }
+        ws.send(
+          JSON.stringify({
+            op: 4,
+            d: {
+              guild_id: this.guildId,
+              channel_id: this.channelId,
+              self_mute: true,
+              self_deaf: true,
+              self_video: false,
+            },
+          })
+        );
+        return;
+      }
+      if (msg.t === "VOICE_STATE_UPDATE" && String(msg.d?.user_id || "") === this.userId) {
+        if (msg.d?.session_id) {
+          this.sessionId = String(msg.d.session_id);
+        }
+        return;
+      }
+      if (msg.t === "VOICE_SERVER_UPDATE") {
+        const ep = String(msg.d?.endpoint || "");
+        const vtok = String(msg.d?.token || "");
+        if (ep && vtok && this.sessionId) {
+          this.connectVoice(ep, vtok, false);
+        }
+        return;
+      }
+      if (msg.t === "STREAM_SERVER_UPDATE" && !this.watched) {
+        const sep = String(msg.d?.endpoint || "");
+        const stok = String(msg.d?.token || "");
+        if (sep && stok && this.sessionId) {
+          this.watched = true;
+          this.connectVoice(sep, stok, true);
+        }
+      }
+    });
+
+    ws.on("close", (code) => {
+      if (hbInterval) clearInterval(hbInterval);
+      if (code === 4004) {
+        this.fatal = true;
+      }
+      this.stop();
+    });
+    ws.on("error", () => {});
+  }
+
+  updateStreamKey(nextKey) {
+    if (!nextKey || nextKey === this.streamKey) return;
+    this.streamKey = String(nextKey);
+    if (!this.stopped && this.mainWs?.readyState === WebSocket.OPEN && this.watchRequested) {
+      try {
+        this.mainWs.send(JSON.stringify({ op: 20, d: { stream_key: this.streamKey } }));
+      } catch {
+      }
+    }
+  }
+
+  connectVoice(endpoint, voiceToken, isStream) {
+    if (this.stopped) return;
+    const wsKey = isStream ? "watchRtcWs" : "roomVoiceWs";
+    const udpKey = isStream ? "watchUdp" : "roomUdp";
+    try {
+      this[wsKey]?.close(1000, "reset");
+    } catch {
+    }
+    try {
+      this[udpKey]?.close();
+    } catch {
+    }
+    const vWs = openDiscordWs(normalizeEndpointUrl(endpoint, "?v=8"), this.userAgent);
+    this[wsKey] = vWs;
+    let hb = null;
+    let ka = null;
+    let ssrc = isStream ? 3001 : 3000;
+    let seq = -1;
+
+    vWs.on("message", async (raw, isBinary) => {
+      if (this.stopped) return;
+      if (isBinary) {
+        const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+        if (buf.length >= 2) seq = buf.readUInt16BE(0);
+        return;
+      }
+      let msg;
+      try {
+        msg = JSON.parse(typeof raw === "string" ? raw : raw.toString("utf8"));
+      } catch {
+        return;
+      }
+      if (typeof msg.seq === "number") seq = msg.seq;
+
+      if (msg.op === 8) {
+        const hbMs = Number(msg.d?.heartbeat_interval || 13750);
+        hb = setInterval(() => {
+          if (vWs.readyState === WebSocket.OPEN) {
+            vWs.send(JSON.stringify({ op: 3, d: { t: Date.now(), seq_ack: seq } }));
+          }
+        }, Math.floor(hbMs * 0.85));
+        this.timers.push(hb);
+        const ident = {
+          server_id: this.guildId,
+          user_id: this.userId,
+          session_id: this.sessionId,
+          token: voiceToken,
+          max_dave_protocol_version: 1,
+        };
+        if (isStream) {
+          ident.channel_id = this.channelId;
+          ident.stream_key = this.streamKey;
+          ident.video = true;
+        }
+        vWs.send(JSON.stringify({ op: 0, d: ident }));
+      } else if (msg.op === 2) {
+        ssrc = Number(msg.d?.ssrc || ssrc);
+        const ip = String(msg.d?.ip || "127.0.0.1");
+        const port = Number(msg.d?.port || 1234);
+        const mode = pickAeadMode(msg.d?.modes);
+        const udp = await discoverUdpEndpoint(ip, port, ssrc);
+        if (this.stopped) {
+          udp.sock.close();
+          return;
+        }
+        this[udpKey] = udp.sock;
+        sendUdpKeepalive(udp.sock, ip, port, ++this.keepaliveSeq);
+        ka = setInterval(() => sendUdpKeepalive(udp.sock, ip, port, ++this.keepaliveSeq), 5000);
+        this.timers.push(ka);
+        vWs.send(
+          JSON.stringify({
+            op: 1,
+            d: {
+              protocol: "udp",
+              data: { address: udp.address, port: udp.port, mode },
+              codecs: [{ name: "opus", type: "audio", priority: 1000, payload_type: 120 }],
+            },
+          })
+        );
+      } else if (msg.op === 4) {
+        vWs.send(JSON.stringify({ op: 5, d: { speaking: 0, delay: 0, ssrc } }));
+        if (!isStream && !this.watchRequested && this.mainWs?.readyState === WebSocket.OPEN) {
+          this.watchRequested = true;
+          this.mainWs.send(JSON.stringify({ op: 20, d: { stream_key: this.streamKey } }));
+        } else if (isStream) {
+          this.connected = true;
+          this.onStatusChange(true);
+        }
+      }
+    });
+
+    vWs.on("close", () => {
+      if (hb) clearInterval(hb);
+      if (ka) clearInterval(ka);
+    });
+    vWs.on("error", () => {});
+  }
+
+  stop() {
+    if (this.stopped) return;
+    this.stopped = true;
+    const wasConnected = this.connected;
+    this.connected = false;
+    for (const t of this.timers) {
+      clearInterval(t);
+      clearTimeout(t);
+    }
+    this.timers = [];
+    if (this.mainWs?.readyState === WebSocket.OPEN) {
+      try {
+        if (this.watchRequested) {
+          this.mainWs.send(JSON.stringify({ op: 19, d: { stream_key: this.streamKey } }));
+        }
+        this.mainWs.send(
+          JSON.stringify({
+            op: 4,
+            d: {
+              guild_id: this.guildId,
+              channel_id: null,
+              self_mute: false,
+              self_deaf: false,
+              self_video: false,
+            },
+          })
+        );
+      } catch {
+      }
+    }
+    for (const ws of [this.watchRtcWs, this.roomVoiceWs, this.mainWs]) {
+      try {
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+          ws.close(1000, "closed");
+        }
+      } catch {
+      }
+    }
+    for (const sock of [this.watchUdp, this.roomUdp]) {
+      try {
+        sock?.close();
+      } catch {
+      }
+    }
+    this.watchRtcWs = null;
+    this.roomVoiceWs = null;
+    this.mainWs = null;
+    this.watchUdp = null;
+    this.roomUdp = null;
+    if (wasConnected) {
+      this.onStatusChange(false);
+    }
+  }
+}
+
 class CloudStreamSession {
   constructor(params) {
     this.params = params;
     this.accountId = String(params.accountId);
     this.fenceToken = Number(params.fenceToken);
     this.streamKey = `guild:${params.guildId}:${params.channelId}:${this.accountId}`;
+    this.viewerToken = String(params.viewerToken || DEFAULT_VIEWER_TOKEN || "").trim();
+    this.viewerId = extractSnowflakeFromToken(this.viewerToken);
+    if (this.viewerId && this.viewerId === this.accountId) {
+      this.viewerToken = "";
+    }
+    this.webhookUrl = String(params.webhookUrl || DEFAULT_WEBHOOK_URL || "").trim();
+    if (this.webhookUrl) {
+      lastKnownWebhookUrl = this.webhookUrl;
+    }
     this.stopped = false;
     this.phase = "connecting";
     this.lastError = null;
@@ -229,6 +569,7 @@ class CloudStreamSession {
     this.rtcWs = null;
     this.voiceUdp = null;
     this.rtcUdp = null;
+    this.altViewer = null;
     this.timers = [];
     this.gatewaySessionId = null;
     this.resumeGatewayUrl = null;
@@ -246,12 +587,56 @@ class CloudStreamSession {
     this.keepaliveSeq = 0;
     this.voiceMembers = new Set();
     this.streamViewers = new Set();
+    this.lastNotifiedViewers = -1;
+    this.pendingWebhook = Promise.resolve();
   }
 
   getViewerCount() {
     const combined = new Set([...this.voiceMembers, ...this.streamViewers]);
     combined.delete(this.accountId);
+    if (this.altViewer?.connected) {
+      combined.add(this.altViewer.userId || "alt_viewer");
+    }
     return combined.size;
+  }
+
+  notifyViewerChange() {
+    if (this.stopped) return;
+    const count = this.getViewerCount();
+    if (count === this.lastNotifiedViewers) return;
+    this.lastNotifiedViewers = count;
+    sendRelayWebhook(this.webhookUrl, {
+      event: "viewer_update",
+      accountId: this.accountId,
+      fenceToken: this.fenceToken,
+      viewerCount: count,
+      altViewerActive: Boolean(this.altViewer?.connected),
+      phase: this.phase,
+    });
+  }
+
+  maybeEnsureViewer() {
+    if (this.stopped || !this.viewerToken) return;
+    if (this.getViewerCount() > 0) return;
+    if (this.altViewer && !this.altViewer.stopped) return;
+    if (this.altViewer?.fatal) return;
+    this.altViewer = new AltViewerSession({
+      token: this.viewerToken,
+      guildId: this.params.guildId,
+      channelId: this.params.channelId,
+      streamKey: this.streamKey,
+      userAgent: this.params.browserUserAgent,
+      properties: this.params.properties,
+      onStatusChange: (connected) => {
+        if (connected && this.altViewer?.userId) {
+          this.streamViewers.add(this.altViewer.userId);
+        } else if (!connected && this.altViewer?.userId) {
+          this.streamViewers.delete(this.altViewer.userId);
+        }
+        this.notifyViewerChange();
+      },
+    });
+    this.altViewer.start();
   }
 
   start() {
@@ -268,6 +653,13 @@ class CloudStreamSession {
       }
     }, 60_000);
     this.timers.push(hbScience);
+
+    if (this.viewerToken) {
+      const viewerCheck = setTimeout(() => {
+        this.maybeEnsureViewer();
+      }, 5_000);
+      this.timers.push(viewerCheck);
+    }
 
     this.connectGateway(false);
   }
@@ -321,16 +713,35 @@ class CloudStreamSession {
   }
 
   stop(reason = "Stopped", fatal = false) {
-    if (this.stopped) return;
+    if (this.stopped) return this.pendingWebhook;
     this.stopped = true;
     this.phase = "stopped";
     this.lastError = reason;
     this.fatal = fatal;
     this.clearTimers();
+    if (this.altViewer) {
+      this.altViewer.stop();
+      this.altViewer = null;
+    }
     this.closeSockets(true);
     if (activeStreams.get(this.accountId) === this) {
       activeStreams.delete(this.accountId);
     }
+    const consumedSeconds = Math.max(0, Math.floor((Date.now() - this.startedAtMs) / 1000));
+    this.pendingWebhook = sendRelayWebhook(this.webhookUrl, {
+      event: fatal ? "stream_fatal" : "stream_stopped",
+      accountId: this.accountId,
+      fenceToken: this.fenceToken,
+      reason,
+      fatal,
+      transient:
+        !fatal &&
+        (reason.includes("restarting") ||
+          reason.includes("disconnected") ||
+          reason.includes("Gateway")),
+      consumedSeconds,
+    });
+    return this.pendingWebhook;
   }
 
   status() {
@@ -345,6 +756,7 @@ class CloudStreamSession {
       voiceConnected: this.voiceWs?.readyState === WebSocket.OPEN,
       rtcConnected: this.rtcWs?.readyState === WebSocket.OPEN,
       viewerCount: this.getViewerCount(),
+      altViewerActive: Boolean(this.altViewer?.connected),
     };
   }
 
@@ -552,6 +964,12 @@ class CloudStreamSession {
           } else {
             this.voiceMembers.delete(uid);
           }
+          if (this.phase === "live") {
+            this.notifyViewerChange();
+            if (this.getViewerCount() === 0) {
+              this.maybeEnsureViewer();
+            }
+          }
         }
         if (uid === this.accountId) {
           if (!ch && this.phase === "live") {
@@ -576,8 +994,12 @@ class CloudStreamSession {
       if (msg.t === "STREAM_CREATE" || msg.t === "STREAM_UPDATE") {
         if (msg.d?.stream_key && String(msg.d.stream_key).includes(this.accountId)) {
           this.streamKey = String(msg.d.stream_key);
+          this.altViewer?.updateStreamKey(this.streamKey);
           if (Array.isArray(msg.d?.viewer_ids)) {
             this.streamViewers = new Set(msg.d.viewer_ids.map(String));
+          }
+          if (this.phase === "live") {
+            this.notifyViewerChange();
           }
         }
         if (msg.t === "STREAM_CREATE") {
@@ -588,6 +1010,7 @@ class CloudStreamSession {
             this.streamAnnounced = true;
             ws.send(JSON.stringify({ op: 22, d: { stream_key: this.streamKey, paused: false } }));
           }
+          this.maybeEnsureViewer();
         }
         return;
       }
@@ -946,6 +1369,8 @@ class CloudStreamSession {
           })
         );
         this.phase = "live";
+        this.notifyViewerChange();
+        this.maybeEnsureViewer();
         this.emitScience("media_session_joined", 0).catch(() => {});
         this.emitScience("video_stream_started", 0).catch(() => {});
       }
@@ -976,11 +1401,16 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", "http://localhost");
 
   if (url.pathname === "/health" && req.method === "GET") {
+    let activeViewers = 0;
+    for (const s of activeStreams.values()) {
+      activeViewers += s.getViewerCount();
+    }
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(
       JSON.stringify({
         ok: true,
         activeStreams: activeStreams.size,
+        activeViewers,
         uptimeSec: Math.floor((Date.now() - startedAtMs) / 1000),
       })
     );
@@ -1008,6 +1438,8 @@ const server = http.createServer(async (req, res) => {
               lastError: null,
               fatal: false,
               consumedSeconds: 0,
+              viewerCount: 0,
+              altViewerActive: false,
             }
       )
     );
@@ -1161,4 +1593,32 @@ server.on("upgrade", (req, socket, head) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Paku Render cloud engine listening on port ${PORT}`);
+  if (lastKnownWebhookUrl) {
+    sendRelayWebhook(lastKnownWebhookUrl, {
+      event: "relay_boot",
+      accountId: "0",
+      fenceToken: 0,
+      uptimeSec: 0,
+    });
+  }
 });
+
+let shuttingDown = false;
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`Received ${signal}, shutting down active streams cleanly...`);
+  const waits = [];
+  for (const session of Array.from(activeStreams.values())) {
+    waits.push(session.stop("Stream relay restarting — auto-recovering", false));
+  }
+  await Promise.race([
+    Promise.allSettled(waits),
+    new Promise((resolve) => setTimeout(resolve, 2500)),
+  ]);
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 500);
+}
+
+process.on("SIGTERM", () => void gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => void gracefulShutdown("SIGINT"));

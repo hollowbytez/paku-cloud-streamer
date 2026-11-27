@@ -1,0 +1,16 @@
+services:
+  paku-streamer:
+    build: .
+    container_name: paku-cloud-streamer
+    restart: unless-stopped
+    stop_signal: SIGTERM
+    stop_grace_period: 10s
+    env_file:
+      - .env
+    ports:
+      - "${PORT:-10000}:10000"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -12,3 +12,5 @@ services:
         value: 10000
       - key: EGRESS_RELAY_SECRET
         sync: false
+      - key: PAKU_WEBHOOK_URL
+        value: https://paku.pagalonetap7770.workers.dev/relay/stream-event
