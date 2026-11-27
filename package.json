@@ -11,6 +11,7 @@
     "node": ">=20.0.0"
   },
   "dependencies": {
+    "@snazzah/davey": "^0.2.0",
     "ws": "^8.23.0"
   }
 }

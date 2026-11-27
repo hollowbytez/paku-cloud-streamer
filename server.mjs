@@ -3,6 +3,7 @@ import dgram from "node:dgram";
 import http from "node:http";
 import tls from "node:tls";
 import WebSocket from "ws";
+import { DAVESession, ProposalsOperationType } from "@snazzah/davey";
 
 const PORT = Number(process.env.PORT || 10000);
 const SECRET = (process.env.EGRESS_RELAY_SECRET || "").trim();
@@ -211,7 +212,9 @@ function sendUdpKeepalive(sock, ip, port, seq = 0) {
   }
 }
 
-function sendEncryptedOpusSilence(sock, ip, port, secretKey, ssrc, state) {
+const OPUS_SILENCE = Buffer.from([0xf8, 0xff, 0xfe]);
+
+function sendEncryptedOpusSilence(sock, ip, port, secretKey, ssrc, state, rawFrame = OPUS_SILENCE) {
   if (!sock || !secretKey || secretKey.length !== 32) {
     return;
   }
@@ -226,7 +229,7 @@ function sendEncryptedOpusSilence(sock, ip, port, secretKey, ssrc, state) {
     nonce.writeUInt32BE(state.nonce >>> 0, 0);
     const cipher = crypto.createCipheriv("aes-256-gcm", secretKey, nonce);
     cipher.setAAD(rtp);
-    const encrypted = Buffer.concat([cipher.update(Buffer.from([0xf8, 0xff, 0xfe])), cipher.final()]);
+    const encrypted = Buffer.concat([cipher.update(rawFrame), cipher.final()]);
     const tag = cipher.getAuthTag();
     const tail = Buffer.alloc(4);
     tail.writeUInt32BE(state.nonce >>> 0, 0);
@@ -235,6 +238,164 @@ function sendEncryptedOpusSilence(sock, ip, port, secretKey, ssrc, state) {
     state.ts = (state.ts + 960) >>> 0;
     state.nonce = (state.nonce + 1) >>> 0;
   } catch {
+  }
+}
+
+class DaveController {
+  constructor(userId, channelId, sendBinary, sendJson) {
+    this.userId = String(userId);
+    this.channelId = String(channelId);
+    this.sendBinary = sendBinary;
+    this.sendJson = sendJson;
+    this.session = null;
+    this.protocolVersion = 0;
+    this.recognizedUsers = new Set([this.userId]);
+  }
+
+  initVersion(version) {
+    const v = Number(version || 0);
+    this.protocolVersion = v;
+    if (v <= 0) {
+      if (this.session) {
+        try {
+          this.session.reset();
+        } catch {
+        }
+      }
+      return;
+    }
+    if (!this.session) {
+      this.session = new DAVESession(v, this.userId, this.channelId);
+    } else {
+      this.session.reinit(v, this.userId, this.channelId);
+    }
+    this.pushKeyPackage();
+  }
+
+  pushKeyPackage() {
+    if (!this.session || this.protocolVersion <= 0) return;
+    try {
+      const pkg = this.session.getSerializedKeyPackage();
+      this.sendBinary(Buffer.concat([Buffer.from([26]), pkg]));
+    } catch {
+    }
+  }
+
+  encryptOpus(frame) {
+    if (this.protocolVersion > 0 && this.session?.canEncrypt) {
+      try {
+        return this.session.encryptOpus(frame);
+      } catch {
+      }
+    }
+    return frame;
+  }
+
+  handleJson(msg) {
+    const op = msg?.op;
+    const d = msg?.d;
+    if (op === 11 && Array.isArray(d?.user_ids)) {
+      for (const uid of d.user_ids) {
+        this.recognizedUsers.add(String(uid));
+      }
+      return;
+    }
+    if (op === 13 && d?.user_id) {
+      this.recognizedUsers.delete(String(d.user_id));
+      return;
+    }
+    if (op === 4) {
+      this.initVersion(Number(d?.dave_protocol_version ?? 0));
+      return;
+    }
+    if (op === 24) {
+      if (Number(d?.epoch ?? 0) === 1) {
+        this.initVersion(Number(d?.protocol_version ?? 1));
+      }
+      return;
+    }
+    if (op === 21) {
+      const tid = Number(d?.transition_id ?? 0);
+      const pv = Number(d?.protocol_version ?? 0);
+      if (pv === 0) {
+        this.protocolVersion = 0;
+        try {
+          this.session?.reset();
+        } catch {
+        }
+      } else if (this.session) {
+        this.protocolVersion = pv;
+        try {
+          this.session.prepareTransition(tid, pv);
+        } catch {
+        }
+      }
+      if (tid !== 0) {
+        this.sendJson({ op: 23, d: { transition_id: tid } });
+      }
+      return;
+    }
+    if (op === 22 && this.session) {
+      try {
+        this.session.executeTransition(Number(d?.transition_id ?? 0));
+      } catch {
+      }
+    }
+  }
+
+  handleBinary(buf) {
+    if (!buf || buf.length < 3 || !this.session) return;
+    const op = buf.readUInt8(2);
+    const recognized = Array.from(this.recognizedUsers);
+
+    if (op === 25) {
+      try {
+        this.session.setExternalSender(buf.subarray(3));
+        this.pushKeyPackage();
+      } catch {
+      }
+      return;
+    }
+
+    if (op === 27 && buf.length >= 4) {
+      try {
+        const opType = buf.readUInt8(3) === 1 ? ProposalsOperationType.REVOKE : ProposalsOperationType.APPEND;
+        const res = this.session.processProposals(opType, buf.subarray(4), recognized);
+        if (res?.commit) {
+          const parts = [Buffer.from([28]), res.commit];
+          if (res.welcome) {
+            parts.push(res.welcome);
+          }
+          this.sendBinary(Buffer.concat(parts));
+        }
+      } catch {
+      }
+      return;
+    }
+
+    if (op === 29 && buf.length >= 5) {
+      const tid = buf.readUInt16BE(3);
+      try {
+        if (this.session.processCommit(buf.subarray(5))) {
+          this.session.prepareTransition(tid, this.protocolVersion || 1);
+          this.sendJson({ op: 23, d: { transition_id: tid } });
+        }
+      } catch {
+        this.sendJson({ op: 31, d: { transition_id: tid } });
+      }
+      return;
+    }
+
+    if (op === 30 && buf.length >= 5) {
+      const tid = buf.readUInt16BE(3);
+      try {
+        this.session.processWelcome(buf.subarray(5), recognized);
+        this.session.prepareTransition(tid, this.protocolVersion || 1);
+        this.sendJson({ op: 23, d: { transition_id: tid } });
+      } catch {
+        this.sendJson({ op: 31, d: { transition_id: tid } });
+      }
+    }
   }
 }
 
@@ -260,10 +421,16 @@ class AltViewerSession {
   constructor({ token, guildId, channelId, streamKey, userAgent, properties, onStatusChange }) {
     this.token = String(token || "").trim();
     this.guildId = String(guildId);
+    this.rtcServerId = String(guildId);
     this.channelId = String(channelId);
     this.streamKey = String(streamKey);
     this.userAgent = userAgent || DEFAULT_UA;
-    this.properties = properties || { os: "Windows", browser: "Discord Client", release_channel: "stable" };
+    this.properties = {
+      ...(properties || { os: "Windows", browser: "Discord Client", release_channel: "stable" }),
+      client_launch_id: crypto.randomUUID(),
+      launch_signature: crypto.randomUUID(),
+      client_heartbeat_session_id: crypto.randomUUID(),
+    };
     this.onStatusChange = typeof onStatusChange === "function" ? onStatusChange : () => {};
     this.userId = extractSnowflakeFromToken(this.token);
     this.stopped = false;
@@ -276,6 +443,7 @@ class AltViewerSession {
     this.watchUdp = null;
     this.timers = [];
     this.sessionId = "";
+    this.resumeGatewayUrl = null;
     this.lastSeq = null;
     this.watched = false;
     this.watchRequested = false;
@@ -303,6 +471,17 @@ class AltViewerSession {
         ws.send(JSON.stringify({ op: 1, d: this.lastSeq }));
         return;
       }
+      if (msg.op === 7 || msg.op === 9) {
+        if (msg.op === 9 && !msg.d) {
+          this.sessionId = "";
+          this.lastSeq = null;
+        }
+        try {
+          ws.close(4000, "reconnect");
+        } catch {
+        }
+        return;
+      }
       if (msg.op === 10) {
         const ms = Number(msg.d?.heartbeat_interval || 41250);
         hbInterval = setInterval(() => {
@@ -328,6 +507,9 @@ class AltViewerSession {
       }
       if (msg.t === "READY") {
         this.sessionId = String(msg.d?.session_id || "");
+        if (typeof msg.d?.resume_gateway_url === "string") {
+          this.resumeGatewayUrl = msg.d.resume_gateway_url;
+        }
         if (msg.d?.user?.id) {
           this.userId = String(msg.d.user.id);
         }
@@ -359,6 +541,12 @@ class AltViewerSession {
         }
         return;
       }
+      if (msg.t === "STREAM_CREATE" && msg.d?.rtc_server_id) {
+        if (String(msg.d?.stream_key || "") === this.streamKey) {
+          this.rtcServerId = String(msg.d.rtc_server_id);
+        }
+        return;
+      }
       if (msg.t === "STREAM_SERVER_UPDATE" && !this.watched) {
         const sep = String(msg.d?.endpoint || "");
         const stok = String(msg.d?.token || "");
@@ -371,6 +559,9 @@ class AltViewerSession {
 
     ws.on("close", (code) => {
       if (hbInterval) clearInterval(hbInterval);
+      if (code !== 1000 && !this.stopped) {
+        console.log(`[viewer] ws_close uid=${this.userId} code=${code}`);
+      }
       if (code === 4004) {
         this.fatal = true;
       }
@@ -379,7 +570,10 @@ class AltViewerSession {
     ws.on("error", () => {});
   }
 
-  updateStreamKey(nextKey) {
+  updateStreamKey(nextKey, nextRtcServerId) {
+    if (nextRtcServerId) {
+      this.rtcServerId = String(nextRtcServerId);
+    }
     if (!nextKey || nextKey === this.streamKey) return;
     this.streamKey = String(nextKey);
     if (!this.stopped && this.mainWs?.readyState === WebSocket.OPEN && this.watchRequested) {
@@ -404,6 +598,16 @@ class AltViewerSession {
     }
     const vWs = openDiscordWs(normalizeEndpointUrl(endpoint, "?v=8"), this.userAgent);
     this[wsKey] = vWs;
+    const dave = new DaveController(
+      this.userId,
+      this.channelId,
+      (buf) => {
+        if (vWs.readyState === WebSocket.OPEN) vWs.send(buf);
+      },
+      (obj) => {
+        if (vWs.readyState === WebSocket.OPEN) vWs.send(JSON.stringify(obj));
+      }
+    );
     let hb = null;
     let ka = null;
     let ssrc = isStream ? 3001 : 3000;
@@ -414,6 +618,7 @@ class AltViewerSession {
       if (isBinary) {
         const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
         if (buf.length >= 2) seq = buf.readUInt16BE(0);
+        dave.handleBinary(buf);
         return;
       }
       let msg;
@@ -423,6 +628,7 @@ class AltViewerSession {
         return;
       }
       if (typeof msg.seq === "number") seq = msg.seq;
+      dave.handleJson(msg);
 
       if (msg.op === 8) {
         const hbMs = Number(msg.d?.heartbeat_interval || 13750);
@@ -433,7 +639,7 @@ class AltViewerSession {
         }, Math.floor(hbMs * 0.85));
         this.timers.push(hb);
         const ident = {
-          server_id: this.guildId,
+          server_id: isStream ? this.rtcServerId : this.guildId,
           user_id: this.userId,
           session_id: this.sessionId,
           token: voiceToken,
@@ -481,9 +687,12 @@ class AltViewerSession {
       }
     });
 
-    vWs.on("close", () => {
+    vWs.on("close", (code) => {
       if (hb) clearInterval(hb);
       if (ka) clearInterval(ka);
+      if (code !== 1000 && !this.stopped) {
+        console.log(`[viewer] voice_close stream=${isStream} uid=${this.userId} code=${code}`);
+      }
     });
     vWs.on("error", () => {});
   }
@@ -582,6 +791,7 @@ class CloudStreamSession {
     this.voiceToken = "";
     this.activeVoiceSig = "";
     this.streamAnnounced = false;
+    this.pendingStreamServer = null;
     this.streamRecreates = 0;
     this.reconnectCount = 0;
     this.keepaliveSeq = 0;
@@ -640,11 +850,24 @@ class CloudStreamSession {
   }
 
   start() {
+    console.log(`[stream] start account=${this.accountId} guild=${this.params.guildId} channel=${this.params.channelId}`);
     const durationMs = Math.max(60_000, this.expiresAtMs - Date.now());
     const expTimer = setTimeout(() => {
       this.stop("Stream duration reached");
     }, durationMs);
     this.timers.push(expTimer);
+
+    const handshakeTimer = setTimeout(() => {
+      if (!this.stopped && this.phase !== "live") {
+        const detail =
+          this.phase === "connecting"
+            ? "Discord Gateway connect timed out"
+            : "Voice join or Go Live timed out — verify account can Connect & Stream in the voice room";
+        console.log(`[stream] handshake_timeout account=${this.accountId} phase=${this.phase}`);
+        this.stop(detail, false);
+      }
+    }, 25_000);
+    this.timers.push(handshakeTimer);
 
     const hbScience = setInterval(() => {
       if (!this.stopped && this.phase === "live") {
@@ -718,6 +941,7 @@ class CloudStreamSession {
     this.phase = "stopped";
     this.lastError = reason;
     this.fatal = fatal;
+    console.log(`[stream] stop account=${this.accountId} fatal=${fatal} reason=${reason}`);
     this.clearTimers();
     if (this.altViewer) {
       this.altViewer.stop();
@@ -994,7 +1218,7 @@ class CloudStreamSession {
       if (msg.t === "STREAM_CREATE" || msg.t === "STREAM_UPDATE") {
         if (msg.d?.stream_key && String(msg.d.stream_key).includes(this.accountId)) {
           this.streamKey = String(msg.d.stream_key);
-          this.altViewer?.updateStreamKey(this.streamKey);
+          this.altViewer?.updateStreamKey(this.streamKey, msg.d?.rtc_server_id);
           if (Array.isArray(msg.d?.viewer_ids)) {
             this.streamViewers = new Set(msg.d.viewer_ids.map(String));
           }
@@ -1010,13 +1234,24 @@ class CloudStreamSession {
             this.streamAnnounced = true;
             ws.send(JSON.stringify({ op: 22, d: { stream_key: this.streamKey, paused: false } }));
           }
+          if (this.pendingStreamServer && this.voiceSessionId) {
+            const p = this.pendingStreamServer;
+            this.pendingStreamServer = null;
+            this.connectStreamRtc(p.ep, p.stok);
+          }
           this.maybeEnsureViewer();
         }
         return;
       }
 
       if (msg.t === "STREAM_DELETE") {
-        if (!this.stopped && this.streamRecreates < 5 && ws.readyState === WebSocket.OPEN) {
+        if (this.stopped) return;
+        if (this.streamRecreates >= 3) {
+          console.log(`[stream] stream_delete_limit account=${this.accountId}`);
+          this.stop("Discord closed the Go Live stream repeatedly", false);
+          return;
+        }
+        if (ws.readyState === WebSocket.OPEN) {
           this.streamRecreates += 1;
           this.streamAnnounced = false;
           const retryTimer = setTimeout(() => {
@@ -1046,7 +1281,19 @@ class CloudStreamSession {
           this.streamKey = String(msg.d.stream_key);
         }
         if (ep && stok && this.voiceSessionId) {
-          this.connectStreamRtc(ep, stok);
+          if (!this.streamAnnounced && this.rtcServerId === String(this.params.guildId)) {
+            this.pendingStreamServer = { ep, stok };
+            const fbTimer = setTimeout(() => {
+              if (!this.stopped && this.pendingStreamServer) {
+                const p = this.pendingStreamServer;
+                this.pendingStreamServer = null;
+                this.connectStreamRtc(p.ep, p.stok);
+              }
+            }, 350);
+            this.timers.push(fbTimer);
+          } else {
+            this.connectStreamRtc(ep, stok);
+          }
         }
       }
     });
@@ -1057,6 +1304,7 @@ class CloudStreamSession {
         hbInterval = null;
       }
       if (this.stopped) return;
+      console.log(`[stream] gw_close account=${this.accountId} code=${code}`);
       if (code === 4004) {
         this.stop("TOKEN_INVALID", true);
         return;
@@ -1123,11 +1371,23 @@ class CloudStreamSession {
     const url = normalizeEndpointUrl(this.voiceEndpoint, "?v=8");
     const vWs = openDiscordWs(url, this.params.browserUserAgent);
     this.voiceWs = vWs;
+    const dave = new DaveController(
+      this.accountId,
+      this.params.channelId,
+      (buf) => {
+        if (vWs.readyState === WebSocket.OPEN) vWs.send(buf);
+      },
+      (obj) => {
+        if (vWs.readyState === WebSocket.OPEN) vWs.send(JSON.stringify(obj));
+      }
+    );
     let hbInterval = null;
     let keepaliveInterval = null;
     let ssrc = 1000;
     let announcedGoLive = false;
     let voiceSeq = -1;
+    let roomSecretKey = null;
+    const roomRtpState = { seq: 1, ts: 960, nonce: 1 };
 
     vWs.on("message", async (raw, isBinary) => {
       if (this.stopped) return;
@@ -1136,6 +1396,7 @@ class CloudStreamSession {
         if (buf.length >= 2) {
           voiceSeq = buf.readUInt16BE(0);
         }
+        dave.handleBinary(buf);
         return;
       }
       let msg;
@@ -1147,6 +1408,7 @@ class CloudStreamSession {
       if (typeof msg.seq === "number") {
         voiceSeq = msg.seq;
       }
+      dave.handleJson(msg);
 
       if (msg.op === 8) {
         const hbMs = Number(msg.d?.heartbeat_interval || 13750);
@@ -1181,10 +1443,20 @@ class CloudStreamSession {
         }
         this.voiceUdp = udp.sock;
         sendUdpKeepalive(udp.sock, ip, port, ++this.keepaliveSeq);
-        keepaliveInterval = setInterval(
-          () => sendUdpKeepalive(udp.sock, ip, port, ++this.keepaliveSeq),
-          5_000
-        );
+        keepaliveInterval = setInterval(() => {
+          sendUdpKeepalive(udp.sock, ip, port, ++this.keepaliveSeq);
+          if (roomSecretKey) {
+            sendEncryptedOpusSilence(
+              udp.sock,
+              ip,
+              port,
+              roomSecretKey,
+              ssrc,
+              roomRtpState,
+              dave.encryptOpus(OPUS_SILENCE)
+            );
+          }
+        }, 5_000);
         this.timers.push(keepaliveInterval);
 
         vWs.send(
@@ -1198,6 +1470,9 @@ class CloudStreamSession {
           })
         );
       } else if (msg.op === 4) {
+        if (Array.isArray(msg.d?.secret_key) && msg.d.secret_key.length === 32) {
+          roomSecretKey = Buffer.from(msg.d.secret_key);
+        }
         vWs.send(JSON.stringify({ op: 5, d: { speaking: 0, delay: 0, ssrc } }));
         if (!announcedGoLive && this.mainWs && this.mainWs.readyState === WebSocket.OPEN) {
           announcedGoLive = true;
@@ -1216,9 +1491,12 @@ class CloudStreamSession {
       }
     });
 
-    vWs.on("close", () => {
+    vWs.on("close", (code) => {
       if (hbInterval) clearInterval(hbInterval);
       if (keepaliveInterval) clearInterval(keepaliveInterval);
+      if (code !== 1000 && !this.stopped) {
+        console.log(`[stream] room_voice_close account=${this.accountId} code=${code}`);
+      }
     });
     vWs.on("error", () => {});
   }
@@ -1242,6 +1520,16 @@ class CloudStreamSession {
     const url = normalizeEndpointUrl(endpoint, "?v=8");
     const sWs = openDiscordWs(url, this.params.browserUserAgent);
     this.rtcWs = sWs;
+    const dave = new DaveController(
+      this.accountId,
+      this.params.channelId,
+      (buf) => {
+        if (sWs.readyState === WebSocket.OPEN) sWs.send(buf);
+      },
+      (obj) => {
+        if (sWs.readyState === WebSocket.OPEN) sWs.send(JSON.stringify(obj));
+      }
+    );
     let hbInterval = null;
     let keepaliveInterval = null;
     let ssrc = 2000;
@@ -1255,6 +1543,7 @@ class CloudStreamSession {
         if (buf.length >= 2) {
           rtcSeq = buf.readUInt16BE(0);
         }
+        dave.handleBinary(buf);
         return;
       }
       let msg;
@@ -1266,6 +1555,7 @@ class CloudStreamSession {
       if (typeof msg.seq === "number") {
         rtcSeq = msg.seq;
       }
+      dave.handleJson(msg);
 
       if (msg.op === 8) {
         const hbMs = Number(msg.d?.heartbeat_interval || 13750);
@@ -1311,7 +1601,15 @@ class CloudStreamSession {
         keepaliveInterval = setInterval(() => {
           sendUdpKeepalive(udp.sock, ip, port, ++this.keepaliveSeq);
           if (secretKey) {
-            sendEncryptedOpusSilence(udp.sock, ip, port, secretKey, ssrc, rtpState);
+            sendEncryptedOpusSilence(
+              udp.sock,
+              ip,
+              port,
+              secretKey,
+              ssrc,
+              rtpState,
+              dave.encryptOpus(OPUS_SILENCE)
+            );
           }
         }, 2_000);
         this.timers.push(keepaliveInterval);
@@ -1369,6 +1667,7 @@ class CloudStreamSession {
           })
         );
         this.phase = "live";
+        console.log(`[stream] live account=${this.accountId} dave=${dave.protocolVersion}`);
         this.notifyViewerChange();
         this.maybeEnsureViewer();
         this.emitScience("media_session_joined", 0).catch(() => {});
@@ -1376,9 +1675,27 @@ class CloudStreamSession {
       }
     });
 
-    sWs.on("close", () => {
+    sWs.on("close", (code) => {
       if (hbInterval) clearInterval(hbInterval);
       if (keepaliveInterval) clearInterval(keepaliveInterval);
+      if (code !== 1000 && !this.stopped) {
+        console.log(`[stream] rtc_close account=${this.accountId} code=${code}`);
+        if (this.phase === "live" && this.mainWs?.readyState === WebSocket.OPEN && this.streamRecreates < 3) {
+          this.streamRecreates += 1;
+          this.streamAnnounced = false;
+          this.mainWs.send(
+            JSON.stringify({
+              op: 18,
+              d: {
+                type: "guild",
+                guild_id: String(this.params.guildId),
+                channel_id: String(this.params.channelId),
+                preferred_region: null,
+              },
+            })
+          );
+        }
+      }
     });
     sWs.on("error", () => {});
   }
